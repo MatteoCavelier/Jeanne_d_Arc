@@ -14,7 +14,8 @@ print(len(columns))
 
 dataset = pd.read_csv(url, names=columns)
 
-dataset["dst_host_srv_rerror_rate"], _ = pd.factorize(dataset["dst_host_srv_rerror_rate"])
+relevant_columns = ["duration", "protocol_type", "src_bytes", "dst_bytes", "flag", "count", "srv_count", "same_srv_rate", "diff_srv_rate", "srv_diff_host_rate", "label"]
+dataset = dataset[relevant_columns]
 
 dataset.dropna(inplace=True)
 
@@ -23,7 +24,7 @@ dataset.drop_duplicates(inplace=True)
 if dataset['duration'].dtype == 'object':
     dataset['duration'] = pd.to_numeric(dataset['duration'], errors='coerce')
 
-categorical_cols = ["protocol_type", "service", "flag"]
+categorical_cols = ["protocol_type", "flag"]
 for col in categorical_cols:
     dataset[col] = pd.factorize(dataset[col])[0]
 
@@ -54,3 +55,26 @@ def classifier(model, **kwargs):
 
 
 classifier(model_RF, duration=1, src_bytes=500)
+
+
+from scapy.all import sniff
+
+# Capture un seul paquet et extrait les informations pertinentes
+def process_packet(packet):
+    data = {
+        "duration": 1,  # La durée peut être estimée ou remplacée par une valeur par défaut
+        "protocol_type": packet.proto,  # Numéro du protocole (ex. 6 = TCP, 17 = UDP)
+        "src_bytes": len(packet),  # Taille totale du paquet
+        "dst_bytes": 0,  # Peut être 0 si on ne connaît pas la réponse
+        "flag": 0,  # Les flags TCP nécessitent une extraction plus fine
+        "count": 1,  # Nombre de connexions (simulé)
+        "srv_count": 1,  # Nombre de connexions au même service
+        "same_srv_rate": 0.5,  # Valeur par défaut
+        "diff_srv_rate": 0.5,  # Valeur par défaut
+        "srv_diff_host_rate": 0.5,  # Valeur par défaut
+    }
+    prediction = classifier(model_RF, **data)
+    print("Prédiction du paquet capturé :", prediction)
+
+# Capture un paquet et applique le classificateur
+sniff(count=1, prn=process_packet)
