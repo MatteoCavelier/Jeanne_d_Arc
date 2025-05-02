@@ -7,6 +7,8 @@ import threading
 import time
 from collections import defaultdict
 import random
+import streamlit.components.v1 as components
+from streamlit_autorefresh import st_autorefresh
 
 # ===================== Session =====================
 if 'alerts' not in st.session_state:
@@ -119,7 +121,7 @@ def process_packet(packet):
 
 def start_sniffing():
     while True:
-        sniff(filter="ip", prn=process_packet, store=False)
+        sniff(iface=r"\Device\NPF_{DB64A3AD-B8A6-4E27-9233-8BB72C8AF18A}", filter="ip", prn=process_packet, store=False)
 
 
 # ===================== Simuler une fausse attaque =====================
