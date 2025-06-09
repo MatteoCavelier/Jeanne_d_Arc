@@ -177,7 +177,6 @@ def process_and_reset_conn(flow_key):
         alerts_not_in_interface.append(f"[IA] Attaque détectée de {src}:{sport} vers {dst}:{dport}")
         print(f"[ALERTE] Attaque détectée de {src}:{sport} vers {dst}:{dport}")
 
-    del conn_flows[flow_key]
 
 def handle_packet(packet):
     try:
