@@ -28,13 +28,11 @@ if 'ia_in_action' not in interface.session_state:
 # ====================================================================================================================== Charger et entraîner modèle
 @interface.cache_resource
 def load_model():
-
     if os.path.exists("mon_model_rf.joblib"):
         model_prep = joblib.load("mon_model_rf.joblib")
     else:
         dataset = pandas_lib.read_csv("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
         dataset.columns = dataset.columns.str.strip()
-
         keep_cols = [
             "Flow Duration", "Total Fwd Packets", "Total Backward Packets",
             "Total Length of Fwd Packets", "Total Length of Bwd Packets", "Label"
@@ -64,7 +62,7 @@ def load_model():
         search.fit(X_train_prep, y_train)
         model_prep = search.best_estimator_
 
-        # Save le modele
+        # Sauvegarde du modèle
         joblib.dump(model_prep, "mon_model_rf.joblib")
 
         y_pred = model_prep.predict(X_test_prep)
@@ -74,6 +72,8 @@ def load_model():
             interface.write("### Rapport de classification")
             report_attack = report['attack']
             interface.write(f"Précision : {report_attack['precision']:.4f}")
+
+        return model_prep, data_content.columns.tolist(), data_content, data_label, dataset
 
     dataset = pandas_lib.read_csv("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
     dataset.columns = dataset.columns.str.strip()
@@ -121,91 +121,128 @@ def do_prediction(param_model, data_to_predict):
 
 # ====================================================================================================================== Suivi des connexions
 
-conn = {
-    "packets": [],
-    "start": None,
-    "end": None,
-    "src": None,
-    "dst": None
-}
+TIMEOUT_INACTIVITY = 10  # secondes
+
+conn_flows = {}
+
+def make_flow_key(ip1, port1, ip2, port2):
+    if (ip1, port1) < (ip2, port2):
+        return (ip1, port1, ip2, port2)
+    else:
+        return (ip2, port2, ip1, port1)
+
+def process_and_reset_conn(flow_key):
+    conn = conn_flows.get(flow_key)
+    if not conn or not conn["packets"]:
+        return
+
+    total_fwd_packets = 0
+    total_bwd_packets = 0
+    total_len_fwd = 0
+    total_len_bwd = 0
+
+    src = conn["src_ip"]
+    sport = conn["src_port"]
+    dst = conn["dst_ip"]
+    dport = conn["dst_port"]
+
+    for pkt in conn["packets"]:
+        if IP in pkt and TCP in pkt:
+            ip = pkt[IP]
+            tcp = pkt[TCP]
+            pkt_tuple = (ip.src, tcp.sport, ip.dst, tcp.dport)
+            if pkt_tuple == (src, sport, dst, dport):
+                total_fwd_packets += 1
+                total_len_fwd += len(pkt)
+            elif pkt_tuple == (dst, dport, src, sport):
+                total_bwd_packets += 1
+                total_len_bwd += len(pkt)
+            else:
+                print(f"[WARN] Paquet hors flux attendu : {pkt_tuple}")
+
+    flow_duration = int((conn["end"] - conn["start"]) * 1e6)  # microsecondes
+
+    sample = {
+        'Flow Duration': flow_duration,
+        'Total Fwd Packets': total_fwd_packets,
+        'Total Backward Packets': total_bwd_packets,
+        'Total Length of Fwd Packets': total_len_fwd,
+        'Total Length of Bwd Packets': total_len_bwd
+    }
+
+    result_prediction = do_prediction(model, sample)
+    print(f"[RESULT] Prédiction flux {src}:{sport} <-> {dst}:{dport} : {result_prediction}")
+
+    if result_prediction == "attack":
+        alerts_not_in_interface.append(f"[IA] Attaque détectée de {src}:{sport} vers {dst}:{dport}")
+        print(f"[ALERTE] Attaque détectée de {src}:{sport} vers {dst}:{dport}")
+
+    del conn_flows[flow_key]
 
 def handle_packet(packet):
     try:
         if IP in packet and TCP in packet:
-            src = packet[IP].src
-            dst = packet[IP].dst
+            ip_layer = packet[IP]
+            tcp_layer = packet[TCP]
 
-            # Ignore les paquets multicast
-            if dst.startswith("224.") or dst.startswith("239."):
+            src_ip = ip_layer.src
+            dst_ip = ip_layer.dst
+            src_port = tcp_layer.sport
+            dst_port = tcp_layer.dport
+
+            if dst_ip.startswith("224.") or dst_ip.startswith("239."):
                 return
 
             now = packet.time
 
-            # Initialisation du flux si nécessaire
-            if conn["start"] is None:
-                conn["start"] = now
-                conn["src"] = src
-                conn["dst"] = dst
-                conn["packets"] = []
+            flow_key = make_flow_key(src_ip, src_port, dst_ip, dst_port)
 
-            conn["end"] = now
-            conn["packets"].append(packet)
-
-            print(f"[INFO] Nouveau paquet ajouté : {src} -> {dst} | Total : {len(conn['packets'])}")
-
-            # Analyse du flux si durée > 2 sec ou >= 20 paquets
-            if now - conn["start"] > 2 or len(conn["packets"]) >= 20:
-                print("[INFO] Conditions de traitement du flux atteintes")
-
-                total_fwd_packets = 0
-                total_bwd_packets = 0
-                total_len_fwd = 0
-                total_len_bwd = 0
-
-                for pkt in conn["packets"]:
-                    if IP in pkt and TCP in pkt:
-                        ip = pkt[IP]
-                        if ip.src == conn["src"] and ip.dst == conn["dst"]:
-                            total_fwd_packets += 1
-                            total_len_fwd += len(pkt)
-                        elif ip.src == conn["dst"] and ip.dst == conn["src"]:
-                            total_bwd_packets += 1
-                            total_len_bwd += len(pkt)
-                        else:
-                            print(f"[WARN] Paquet hors du flux attendu : {ip.src} -> {ip.dst}")
-
-                flow_duration = int((conn["end"] - conn["start"]) * 1e6)  # microsecondes
-
-                sample = {
-                    'Flow Duration': flow_duration,
-                    'Total Fwd Packets': total_fwd_packets,
-                    'Total Backward Packets': total_bwd_packets,
-                    'Total Length of Fwd Packets': total_len_fwd,
-                    'Total Length of Bwd Packets': total_len_bwd
+            if flow_key not in conn_flows:
+                conn_flows[flow_key] = {
+                    "packets": [],
+                    "start": now,
+                    "end": now,
+                    "last_seen": now,
+                    "src_ip": src_ip,
+                    "src_port": src_port,
+                    "dst_ip": dst_ip,
+                    "dst_port": dst_port
                 }
 
-                print(f"[DEBUG] Échantillon extrait : {sample}")
+            conn = conn_flows[flow_key]
 
-                result_prediction = do_prediction(model, sample)
-                print(f"[RESULT] Prédiction : {result_prediction}")
+            pkt_tuple = (src_ip, src_port, dst_ip, dst_port)
+            forward_tuple = (conn["src_ip"], conn["src_port"], conn["dst_ip"], conn["dst_port"])
+            backward_tuple = (conn["dst_ip"], conn["dst_port"], conn["src_ip"], conn["src_port"])
 
-                if sample['Total Fwd Packets'] > 500: result_prediction = "attack"
+            if pkt_tuple == forward_tuple or pkt_tuple == backward_tuple:
+                conn["packets"].append(packet)
+                conn["end"] = now
+                conn["last_seen"] = now
 
-                if result_prediction == "attack":
-                    alerts_not_in_interface.append(f"[IA] Attaque détectée de {src} vers {dst}")
-                    print(f"[ALERTE] Attaque détectée de {src} vers {dst}")
+                FIN_FLAG = 0x01
+                RST_FLAG = 0x04
+                tcp_flags = tcp_layer.flags
 
-                # Réinitialisation du flux
-                conn["start"] = None
-                conn["end"] = None
-                conn["packets"] = []
-                conn["src"] = None
-                conn["dst"] = None
+                if tcp_flags & FIN_FLAG or tcp_flags & RST_FLAG:
+                    process_and_reset_conn(flow_key)
+
+            else:
+                print(f"[WARN] Paquet hors flux pour clé {flow_key}")
+
+            to_remove = []
+            for key, c in conn_flows.items():
+                if now - c["last_seen"] > TIMEOUT_INACTIVITY:
+                    process_and_reset_conn(key)
+                    to_remove.append(key)
+
+            for key in to_remove:
+                if key in conn_flows:
+                    del conn_flows[key]
 
     except Exception as e:
         alerts_not_in_interface.append(f"Erreur dans handle_packet : {e}")
         print(f"[ERREUR] handle_packet : {e}")
-
 
 
 def read_network():
@@ -258,7 +295,7 @@ if interface.button("Donner attaque à l'IA (test du modèle)"):
     else:
         alerts_not_in_interface.append("Détection raté sur attaque simulée.")
 
-if interface.button("Envoyer attaque sur réseaux"):
+if interface.button("Envoyer attaque sur réseaux (Linux uniquement)"):
     real_time_attack(global_ip_cible, global_ip_retour, 80, count=1000)
 
 # Le trait graphique de séparation
