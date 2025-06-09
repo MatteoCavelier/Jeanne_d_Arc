@@ -1,7 +1,7 @@
 import streamlit as interface
 from scapy.all import sniff, send
 from scapy.layers.inet import IP, TCP
-import pandas as pandas_lib
+import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import classification_report
@@ -10,6 +10,8 @@ import random
 import matplotlib.pyplot as plt
 import os
 import joblib
+from collections import defaultdict, deque
+import time
 
 
 global_ip_cible = "192.168.1.194"
@@ -31,7 +33,7 @@ def load_model():
     if os.path.exists("mon_model_rf.joblib"):
         model_prep = joblib.load("mon_model_rf.joblib")
     else:
-        dataset = pandas_lib.read_csv("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
+        dataset = pd.read_csv("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
         dataset.columns = dataset.columns.str.strip()
         keep_cols = [
             "Flow Duration", "Total Fwd Packets", "Total Backward Packets",
@@ -75,7 +77,7 @@ def load_model():
 
         return model_prep, data_content.columns.tolist(), data_content, data_label, dataset
 
-    dataset = pandas_lib.read_csv("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
+    dataset = pd.read_csv("Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv")
     dataset.columns = dataset.columns.str.strip()
     dataset = dataset[[
         "Flow Duration", "Total Fwd Packets", "Total Backward Packets",
@@ -102,7 +104,7 @@ with interface.sidebar.expander("Répartition des ATK/NRML", expanded=False):
 
 with interface.sidebar.expander("Importance des variables", expanded=False):
     param_important = model.feature_importances_
-    serie_panda = pandas_lib.Series(param_important, index=global_data_content.columns).sort_values(ascending=True)
+    serie_panda = pd.Series(param_important, index=global_data_content.columns).sort_values(ascending=True)
     figure_fi, axe_fi = plt.subplots()
     serie_panda.plot(kind='barh', ax=axe_fi)
     axe_fi.set_title("Importance des variables")
@@ -111,7 +113,7 @@ with interface.sidebar.expander("Importance des variables", expanded=False):
 # ====================================================================================================================== Prédiction
 def do_prediction(param_model, data_to_predict):
     try:
-        one_line_data_frame = pandas_lib.DataFrame([data_to_predict], columns=categories_dataset)
+        one_line_data_frame = pd.DataFrame([data_to_predict], columns=categories_dataset)
         return param_model.predict(one_line_data_frame)[0]
     except Exception as error:
         interface.session_state.alerts.append(f"Erreur prediction : {error}")
@@ -124,6 +126,9 @@ def do_prediction(param_model, data_to_predict):
 TIMEOUT_INACTIVITY = 10  # secondes
 
 conn_flows = {}
+
+source_ip_tracker = defaultdict(lambda: deque())
+
 
 def make_flow_key(ip1, port1, ip2, port2):
     if (ip1, port1) < (ip2, port2):
@@ -242,6 +247,20 @@ def handle_packet(packet):
     except Exception as e:
         alerts_not_in_interface.append(f"Erreur dans handle_packet : {e}")
         print(f"[ERREUR] handle_packet : {e}")
+    # [NEW] Agrégation des flux par IP source pour détection manuelle
+    src_ip = ip_layer.src
+    now_time = time.time()
+    source_ip_tracker[src_ip].append(now_time)
+
+    # Supprime les timestamps plus vieux que 10 secondes
+    while source_ip_tracker[src_ip] and now_time - source_ip_tracker[src_ip][0] > 10:
+        source_ip_tracker[src_ip].popleft()
+
+    # Règle manuelle simple
+    if len(source_ip_tracker[src_ip]) > 1000:
+        alert_msg = f"[MANUEL] Comportement suspect : {len(source_ip_tracker[src_ip])} flux de {src_ip} en moins de 10s"
+        print(alert_msg)
+        alerts_not_in_interface.append(alert_msg)
 
 
 def read_network():
