@@ -120,6 +120,10 @@ def do_prediction(param_model, data_to_predict):
 
 # ====================================================================================================================== Suivi des connexions
 
+def write_to_log(alert_msg):
+    with open("logs.txt", "a") as log_file:  # Mode "a" pour ajouter sans écraser
+        log_file.write(alert_msg + "\n")
+
 conn = {
     "packets": [],
     "start": None,
@@ -194,6 +198,7 @@ def handle_packet(packet):
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     alert_msg = f"[{timestamp}] [IA] Attaque détectée de {src} vers {dst}"
                     interface.session_state.alerts.append(alert_msg)
+                    write_to_log(alert_msg)
                     print(alert_msg)
 
                 # Réinitialisation du flux
